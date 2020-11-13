@@ -355,24 +355,21 @@ class SpatialMaxPool2d(nn.Module):
         self.padding = padding
 
     def forward(self, x):
-
         # Shape of x : (batch_id, in_channels, n_orientations, kH, kW)
-        # Changed to : (batch_id, n_orientations, in_channels, kH, kW)
-        x_orientation_first = x.permute(0, 2, 1, 3, 4)
-        n_orientations = x_orientation_first.shape[0]
+        n_orientations = x.shape[2]
 
         pooled_responses = [None]*n_orientations
+
         for ori in range(n_orientations):
-            pooled_responses[ori] = F.max_pool2d(input=x_orientation_first[ori],
+            pooled_responses[ori] = F.max_pool2d(input=x[:, :, ori, :, :],
                                                  kernel_size=self.kernel_size,
                                                  stride=self.stride,
                                                  padding=self.padding)
 
-        pooled_responses = torch.stack(pooled_responses)
+        # Stack along orientation axis
+        pooled_responses = torch.stack(pooled_responses, dim=2)
 
-        # Transpose axes to channel first
-        out = pooled_responses.permute(0, 2, 1, 3, 4)
-        return out
+        return pooled_responses
 
 
 
