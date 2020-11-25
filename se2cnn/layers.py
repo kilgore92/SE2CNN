@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 import torch.nn.functional as F
-from math import floor, sin, cos, pi, degrees
+from math import floor, sin, cos, pi, degrees, sqrt
 import numpy as np
 
 class SE2Conv2d(nn.Module):
@@ -46,6 +46,20 @@ class SE2Conv2d(nn.Module):
 
         # Create rotation matrix
         self.multi_rotation_matrix = self.create_multirotation_rotation_matrix()
+
+
+    @staticmethod
+    def initialize_weights(module):
+        """
+        Initialization code taken from nn.Conv2d source code:
+            https://pytorch.org/docs/stable/_modules/torch/nn/modules/conv.html#Conv2d
+        """
+        name = module.__class__.__name__.lower()
+        nn.init.kaiming_normal_(module.weight, a=sqrt(5))
+        if module.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(module.weight)
+            bound = 1 / sqrt(fan_in)
+            nn.init.uniform_(module.bias, -bound, bound)
 
 
     @staticmethod
@@ -211,6 +225,7 @@ class SE2LiftingConv2d(SE2Conv2d):
         # Weights and biases require their gradients to be stored for backprop
         self.weight = Parameter(torch.Tensor(self.out_channels, self.in_channels, self.kernel_size, self.kernel_size))
         self.bias = Parameter(torch.Tensor(self.out_channels))
+        self.apply(self.initialize_weights)
 
     def forward(self, x):
         # Created rotated copies of filters
@@ -222,7 +237,7 @@ class SE2LiftingConv2d(SE2Conv2d):
                                          (self.kernel_size*self.kernel_size, self.in_channels*self.out_channels))
 
         # Rotate kernels via (sparse) matrix multiplication with the rotation matrix
-        set_of_rotated_kernels = torch.mm(self.multi_rotation_matrix, flattened_kernel)
+        set_of_rotated_kernels = torch.mm(self.multi_rotation_matrix.to(flattened_kernel.device), flattened_kernel)
         rotated_kernels_reshaped = torch.reshape(set_of_rotated_kernels,
                                                  (self.n_orientations, self.kernel_size, self.kernel_size, self.in_channels, self.out_channels))
 
@@ -248,7 +263,7 @@ class SE2LiftingConv2d(SE2Conv2d):
         bias_broadcast = self.bias[:, None, None, None]
         conv_output = lifting_conv + bias_broadcast
 
-        return conv_output, rotated_kernels_transposed
+        return conv_output
 
 
 class SE2GroupConv2d(SE2Conv2d):
@@ -261,7 +276,9 @@ class SE2GroupConv2d(SE2Conv2d):
                  out_channels: int = 32,
                  n_orientations: int = 8,
                  kernel_size: int = 3,
-                 padding:int = 0):
+                 padding:int = 0,
+                 output_padding:int = 1, # Required for transposed convolution
+                 transpose:bool = False):
 
 
         super(SE2GroupConv2d, self).__init__(in_channels=in_channels,
@@ -269,13 +286,18 @@ class SE2GroupConv2d(SE2Conv2d):
                                              n_orientations=n_orientations,
                                              kernel_size=kernel_size,
                                              padding=padding)
-
+        self.transpose = transpose
+        self.output_padding = output_padding
         self.weight = Parameter(torch.Tensor(self.out_channels, self.in_channels, self.n_orientations, self.kernel_size, self.kernel_size))
         self.bias = Parameter(torch.Tensor(self.out_channels))
-
+        self.apply(self.initialize_weights)
 
     def forward(self, x):
-        # Part-1 : Rotation of kernels defined on SE(2)
+
+        # Kernels are defined on the SE(2) domain
+        # A rotation action on a SE(2) group element trasforms it as follows: LgF(g') -> (R^-1(x'-x), theta'-theta)
+
+        # Part-1 : Rotation of the planar part of the kernels defined on SE(2)
         # Created rotated copies of filters
         # Transpose axes for behavior consistent with Erik's code (channel-last)
         channel_first_weights = self.weight.permute(3, 4, 2, 1, 0) # (kH, kW, n_ori, inChan, outChan)
@@ -283,7 +305,9 @@ class SE2GroupConv2d(SE2Conv2d):
                                          (self.kernel_size*self.kernel_size, self.n_orientations*self.in_channels*self.out_channels))
 
         # Rotate kernels via (sparse) matrix multiplication with the rotation matrix
-        kernel_rotated_planar = torch.sparse.mm(self.multi_rotation_matrix, flattened_kernel)
+        kernel_rotated_planar = torch.sparse.mm(self.multi_rotation_matrix.to(flattened_kernel.device),
+                                                flattened_kernel)
+
         kernel_rotated_planar_reshaped = torch.reshape(kernel_rotated_planar,
                                                        (self.n_orientations, self.kernel_size, self.kernel_size, self.n_orientations, self.in_channels, self.out_channels))
 
@@ -301,7 +325,7 @@ class SE2GroupConv2d(SE2Conv2d):
                     kernels_temp, (self.kernel_size * self.kernel_size * self.in_channels * self.out_channels, self.n_orientations))
             # Roll along the orientation axis
             roll_matrix = torch.from_numpy(np.roll(np.identity(self.n_orientations, dtype=np.float32), orientation, axis=1))
-            kernels_temp = torch.matmul(kernels_temp, roll_matrix)
+            kernels_temp = torch.matmul(kernels_temp, roll_matrix.to(kernels_temp.device))
             kernels_temp = torch.reshape(
                 kernels_temp, (self.kernel_size, self.kernel_size, self.in_channels, self.out_channels, self.n_orientations))  # [kH,kW,in_chan,out_chan,n_ori]
             kernels_temp = kernels_temp.permute(0, 1, 4, 2, 3) # [kH, kW, n_ori, in_chan, out_chan]
@@ -325,10 +349,20 @@ class SE2GroupConv2d(SE2Conv2d):
 
         # Perform 2-D convolution
         # Output shape: (batch_size, n_orientations*outChan, kH, kW)
-        g_conv = F.conv2d(input=x_reshaped,
-                          weight=rotated_kernels_pre_conv,
-                          bias=None,
-                          padding=self.padding)
+        if self.transpose is False:
+            g_conv = F.conv2d(input=x_reshaped,
+                              weight=rotated_kernels_pre_conv,
+                              bias=None,
+                              padding=self.padding)
+        else:
+            # Re-order weight axes to swap and in and out_channels
+            rotated_kernels_pre_conv = rotated_kernels_pre_conv.permute(1, 0, 2, 3)
+            g_conv = F.conv_transpose2d(input=x_reshaped,
+                                        weight=rotated_kernels_pre_conv,
+                                        bias=None,
+                                        padding=self.padding,
+                                        output_padding=self.output_padding,
+                                        stride=2)
 
         g_conv = torch.reshape(g_conv, (g_conv.shape[0],self.out_channels, self.n_orientations, g_conv.shape[-2], g_conv.shape[-1]))
         # See PyTorch broadcasting rules: https://pytorch.org/docs/stable/notes/broadcasting.html
@@ -361,18 +395,75 @@ class SpatialMaxPool2d(nn.Module):
         pooled_responses = [None]*n_orientations
 
         for ori in range(n_orientations):
-            pooled_responses[ori] = F.max_pool2d(input=x[:, :, ori, :, :],
-                                                 kernel_size=self.kernel_size,
-                                                 stride=self.stride,
-                                                 padding=self.padding)
+            pooled_resp = F.max_pool2d(input=x[:, :, ori, :, :],
+                                       kernel_size=self.kernel_size,
+                                       stride=self.stride,
+                                       padding=self.padding)
 
-        # Stack along orientation axis
-        pooled_responses = torch.stack(pooled_responses, dim=2)
+            # Add dummy axis to pooled responses from all orientations
+            pooled_responses[ori] = pooled_resp[:, :, None, :, :]
+
+
+        # Concatenate pooled responses along orientation axis
+        pooled_responses = torch.cat(pooled_responses, dim=2)
 
         return pooled_responses
 
 
 
+
+class SE2CollapseConv2d(nn.Module):
+    """
+    The opposite of the lifting convolution, this transforms the feature domain
+    from SE(2) to Z^2. A single planar filter is shared over all the orientations.
+    Used in segmentation networks, more expressive than pooling over orientations.
+
+    See http://arxiv.org/abs/1807.00583 for description of the convolution
+
+    """
+
+    def __init__(self,
+                 in_channels:int = 30,
+                 out_channels:int = 2,
+                 n_orientations:int = 12,
+                 padding:int = 0,
+                 kernel_size:int = 3):
+
+        super(SE2CollapseConv2d, self).__init__()
+
+        self.padding = padding
+        self.weight = Parameter(torch.Tensor(out_channels, in_channels*n_orientations, kernel_size, kernel_size))
+        self.bias = Parameter(torch.Tensor(out_channels))
+        self.apply(self.initialize_weights)
+
+    @staticmethod
+    def initialize_weights(module):
+        """
+        Initialization code taken from nn.Conv2d source code:
+            https://pytorch.org/docs/stable/_modules/torch/nn/modules/conv.html#Conv2d
+        """
+        name = module.__class__.__name__.lower()
+        nn.init.kaiming_normal_(module.weight, a=sqrt(5))
+        if module.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(module.weight)
+            bound = 1 / sqrt(fan_in)
+            nn.init.uniform_(module.bias, -bound, bound)
+
+    def forward(self, x):
+
+        # Shape of x : (N, C, n_ori, H, W)
+        # Merge orientation and channel axes
+        x = torch.reshape(x, (x.shape[0], x.shape[1]*x.shape[2], x.shape[3], x.shape[4]))
+
+        conv_out = F.conv2d(input=x,
+                            weight=self.weight,
+                            bias=None,
+                            padding=self.padding)
+
+        # Conv_out shape : (N, out_channels , H, W)
+        bias_broadcast = self.bias[: , None, None]
+        out = conv_out + bias_broadcast
+        return out
 
 
 
